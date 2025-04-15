@@ -18,20 +18,25 @@ using Newtonsoft.Json.Linq;
 using System.Runtime.InteropServices;
 using DirectShowLib;
 using OpenCvSharp.WpfExtensions;
+using System.Drawing;
+using Color = System.Windows.Media.Color;
+using Brushes = System.Windows.Media.Brushes;
+using System.Threading;
 
 namespace LiveTranslateTool
 {
     public partial class MainWindow : System.Windows.Window
     {
-        private VideoCapture _capture;
-        private DispatcherTimer _timer;
+        private VideoCapture _capture; 
+        private CancellationTokenSource _cancellationTokenSource;
         private readonly HttpClient _httpClient = new HttpClient();
-        private const string GoogleTranslateApiKey = "REPLACE WITH API KEY";
         private ListBox _deviceSelector;
         private Canvas _overlayCanvas;
         private List<System.Windows.Rect> _textRegions = new List<System.Windows.Rect>();
         private string _lastExtractedText = "";
         private List<string> _deviceNames = new List<string>();
+        private Dictionary<string, string> _translationCache = new Dictionary<string, string>();
+        private int _frameCounter = 0;  // Counter to process every nth frame
 
         public MainWindow()
         {
@@ -72,7 +77,7 @@ namespace LiveTranslateTool
             }
 
             _deviceSelector.SelectionChanged += DeviceSelector_SelectionChanged;
-            MainGrid.Children.Add(_deviceSelector);
+            TopBar.Children.Add(_deviceSelector);
         }
 
         private void DeviceSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -83,24 +88,77 @@ namespace LiveTranslateTool
                 StartCapture(index);
             }
         }
-
         private void StartCapture(int deviceIndex)
         {
             _capture = new VideoCapture(deviceIndex);
-
-            // Automatically set to best supported format
             SetBestSupportedResolution(deviceIndex);
 
             _overlayCanvas = new Canvas { IsHitTestVisible = false };
             Panel.SetZIndex(_overlayCanvas, 1);
             MainGrid.Children.Add(_overlayCanvas);
 
-            _timer = new DispatcherTimer
+            _cancellationTokenSource = new CancellationTokenSource();
+            Task.Run(() => CaptureLoop(_cancellationTokenSource.Token));
+        }
+
+        private void StopCapture()
+        {
+            _cancellationTokenSource?.Cancel();
+            _capture?.Release();
+            _capture?.Dispose();
+        }
+
+        private async Task CaptureLoop(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
             {
-                Interval = TimeSpan.FromMilliseconds(16)
-            };
-            _timer.Tick += CaptureFrame;
-            _timer.Start();
+                using var frame = new Mat();
+                _capture.Read(frame);
+
+                if (!frame.Empty())
+                {
+                    var bitmap = frame.ToBitmapSource();
+                    bitmap.Freeze(); // Allows cross-thread access
+
+                    Dispatcher.Invoke(() =>
+                    {
+                        VideoImage.Source = bitmap;
+                        _overlayCanvas.Children.Clear();
+                    });
+
+                    if (_frameCounter++ % 5 == 0)
+                    {
+                        string extractedText = await Task.Run(() => ExtractTextFromMat(frame, out _textRegions));
+                        if (!string.IsNullOrWhiteSpace(extractedText) && extractedText != _lastExtractedText)
+                        {
+                            _lastExtractedText = extractedText;
+                            string translated = await TranslateText(extractedText);
+
+                            Dispatcher.Invoke(() =>
+                            {
+                                foreach (var region in _textRegions)
+                                {
+                                    var tb = new TextBlock
+                                    {
+                                        Text = translated,
+                                        Foreground = Brushes.White,
+                                        Background = new SolidColorBrush(Color.FromArgb(180, 0, 0, 0)),
+                                        FontSize = 16,
+                                        Padding = new Thickness(4),
+                                        TextWrapping = TextWrapping.Wrap,
+                                        Effect = new BlurEffect { Radius = 1.5 }
+                                    };
+                                    Canvas.SetLeft(tb, region.X);
+                                    Canvas.SetTop(tb, region.Y);
+                                    _overlayCanvas.Children.Add(tb);
+                                }
+                            });
+                        }
+                    }
+                }
+
+                await Task.Delay(10); // Add small delay to prevent CPU hogging
+            }
         }
 
         private void SetBestSupportedResolution(int index)
@@ -160,6 +218,13 @@ namespace LiveTranslateTool
 
         private async void CaptureFrame(object sender, EventArgs e)
         {
+            if (_frameCounter % 5 != 0)  // Process every 5th frame
+            {
+                _frameCounter++;
+                return;
+            }
+            _frameCounter++;
+
             using var frame = new Mat();
             _capture.Read(frame);
             if (frame.Empty()) return;
@@ -168,10 +233,7 @@ namespace LiveTranslateTool
             VideoImage.Source = bitmap;
             _overlayCanvas.Children.Clear();
 
-            var tempPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid() + ".png");
-            frame.SaveImage(tempPath);
-
-            string extractedText = await Task.Run(() => ExtractText(tempPath, out _textRegions));
+            string extractedText = await Task.Run(() => ExtractTextFromMat(frame, out _textRegions));
 
             if (!string.IsNullOrWhiteSpace(extractedText) && extractedText != _lastExtractedText)
             {
@@ -196,12 +258,18 @@ namespace LiveTranslateTool
             }
         }
 
-        private string ExtractText(string imagePath, out List<System.Windows.Rect> regions)
+        private string ExtractTextFromMat(Mat frame, out List<System.Windows.Rect> regions)
         {
             regions = new List<System.Windows.Rect>();
+
+            // Convert Mat to Bitmap
+            Bitmap bitmap = frame.ToBitmap();
+
+            // Convert Bitmap to Pix (Tesseract compatible)
+            using var pix = Pix.LoadFromMemory(BitmapToByteArray(bitmap));
+
             using var engine = new TesseractEngine("./tessdata", "jpn", EngineMode.Default);
-            using var img = Pix.LoadFromFile(imagePath);
-            using var page = engine.Process(img);
+            using var page = engine.Process(pix);  // Use Pix for processing
 
             var text = page.GetText();
 
@@ -220,17 +288,106 @@ namespace LiveTranslateTool
             return text.Trim();
         }
 
+        private byte[] BitmapToByteArray(Bitmap bitmap)
+        {
+            using (MemoryStream stream = new MemoryStream())
+            {
+                bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+                return stream.ToArray();
+            }
+        }
+
+
+
         private async Task<string> TranslateText(string input)
         {
-            var url =
-                $"https://translation.googleapis.com/language/translate/v2?key={GoogleTranslateApiKey}";
-            var data = new StringContent($"q={Uri.EscapeDataString(input)}&source=ja&target=en&format=text",
-                System.Text.Encoding.UTF8, "application/x-www-form-urlencoded");
+            if (_translationCache.ContainsKey(input))
+            {
+                return _translationCache[input];  // Return cached translation
+            }
 
-            var response = await _httpClient.PostAsync(url, data);
+            var url = "https://libretranslate.com/translate";
+            var data = new
+            {
+                q = input,
+                source = "ja",
+                target = "en",
+                format = "text"
+            };
+
+            var jsonData = Newtonsoft.Json.JsonConvert.SerializeObject(data);
+            var content = new StringContent(jsonData, System.Text.Encoding.UTF8, "application/json");
+
+            var response = await _httpClient.PostAsync(url, content);
             var result = await response.Content.ReadAsStringAsync();
-            var json = JObject.Parse(result);
-            return json["data"]?["translations"]?[0]?["translatedText"]?.ToString() ?? "";
+            var jsonResponse = JObject.Parse(result);
+
+            var translatedText = jsonResponse["translatedText"]?.ToString() ?? "";
+            _translationCache[input] = translatedText;  // Cache the result
+            return translatedText;
+        }
+
+        private async void LoadTestImage_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new Microsoft.Win32.OpenFileDialog
+            {
+                Filter = "Image Files|*.jpg;*.jpeg;*.png;*.bmp"
+            };
+
+            if (dialog.ShowDialog() == true)
+            {
+                try
+                {
+                    // Load the image into a Mat
+                    using var mat = Cv2.ImRead(dialog.FileName);
+                    if (mat.Empty())
+                    {
+                        MessageBox.Show("Could not load image.");
+                        return;
+                    }
+
+                    // Display image
+                    var bitmap = mat.ToBitmapSource();
+                    bitmap.Freeze();
+                    VideoImage.Source = bitmap;
+
+                    _overlayCanvas?.Children.Clear();
+                    if (_overlayCanvas == null)
+                    {
+                        _overlayCanvas = new Canvas { IsHitTestVisible = false };
+                        Panel.SetZIndex(_overlayCanvas, 1);
+                        MainGrid.Children.Add(_overlayCanvas);
+                    }
+
+                    // OCR and Translate
+                    string extractedText = await Task.Run(() => ExtractTextFromMat(mat, out _textRegions));
+                    if (!string.IsNullOrWhiteSpace(extractedText))
+                    {
+                        string translated = await TranslateText(extractedText);
+
+                        foreach (var region in _textRegions)
+                        {
+                            var tb = new TextBlock
+                            {
+                                Text = translated,
+                                Foreground = Brushes.White,
+                                Background = new SolidColorBrush(Color.FromArgb(180, 0, 0, 0)),
+                                FontSize = 16,
+                                Padding = new Thickness(4),
+                                TextWrapping = TextWrapping.Wrap,
+                                Effect = new BlurEffect { Radius = 1.5 }
+                            };
+                            Canvas.SetLeft(tb, region.X);
+                            Canvas.SetTop(tb, region.Y);
+                            _overlayCanvas.Children.Add(tb);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Error processing image: " + ex.Message);
+                }
+            }
         }
     }
 }
