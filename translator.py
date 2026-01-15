@@ -1,73 +1,77 @@
-import pytesseract
-from deep_translator import GoogleTranslator
 import cv2
 import numpy as np
 import threading
 import json
-
-from langdetect import detect, LangDetectException
 import re
+from rapidocr_onnxruntime import RapidOCR
+import argostranslate.translate
 
 class Translator:
     def __init__(self, tesseract_cmd=None):
-        if tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-        
+        # Initializing RapidOCR
+        # det_model_path etc are used by default from the package.
+        self.ocr_engine = RapidOCR()
         self.translation_cache = {}
         
     def extract_text(self, frame):
         if frame is None:
             return []
 
-        # Optimization: Resize for faster OCR if image is huge
-        # But keep it large enough for text detection.
-        # Max width 1000 seems reasonable for speed/quality balance.
-        height, width = frame.shape[:2]
-        max_dim = 1000
-        scale_ratio = 1.0
+        # RapidOCR works natively with BGR images (or internally handles it),
+        # but docs often say RGB. Let's convert to be safe, but it's much faster than Tesseract.
+        # It also handles resizing internally usually, but we can pass raw frame.
         
-        proc_frame = frame
-        if width > max_dim or height > max_dim:
-            if width > height:
-                scale_ratio = max_dim / width
-            else:
-                scale_ratio = max_dim / height
+        # Run OCR
+        # result is a list of [box_points, text, confidence]
+        # box_points is [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+        
+        try:
+            result, elapse = self.ocr_engine(frame)
+        except Exception as e:
+            print(f"OCR Exception: {e}")
+            return []
             
-            new_w = int(width * scale_ratio)
-            new_h = int(height * scale_ratio)
-            proc_frame = cv2.resize(frame, (new_w, new_h))
+        if not result:
+            return []
 
-        rgb_frame = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
-        
-        # Using script/Japanese for better Japanese detection
-        # psm 6 (assume linear text) or 3 (auto) might be better depending on game UI
-        # We will stick to default for now but could tune config.
-        data = pytesseract.image_to_data(rgb_frame, lang='script/Japanese', output_type=pytesseract.Output.DICT)
-        
-        results = []
-        n_boxes = len(data['text'])
-        for i in range(n_boxes):
-            if int(data['conf'][i]) > 40: # Increase confidence threshold
-                text = data['text'][i].strip()
-                if text:
-                    # Strict Japanese Check
-                    if not self.contains_japanese(text):
-                        continue
+        detections = []
+        for item in result:
+            # item structure: [dt_boxes, rec_res, score]
+            # rec_res is text
+            # score is confidence
+            
+            box_points = item[0]
+            text = item[1]
+            score = item[2]
+            
+            if score < 0.4: # Filter low confidence
+                continue
+                
+            if not text:
+                continue
 
-                    # Scale coordinates back to original frame size
-                    x = int(data['left'][i] / scale_ratio)
-                    y = int(data['top'][i] / scale_ratio)
-                    w = int(data['width'][i] / scale_ratio)
-                    h = int(data['height'][i] / scale_ratio)
-
-                    results.append({
-                        'text': text,
-                        'x': x,
-                        'y': y,
-                        'w': w,
-                        'h': h
-                    })
-        return results
+            # Strict Japanese Check
+            if not self.contains_japanese(text):
+                continue
+            
+            # Convert 4 points to x, y, w, h bounding box
+            xs = [p[0] for p in box_points]
+            ys = [p[1] for p in box_points]
+            x_min, x_max = int(min(xs)), int(max(xs))
+            y_min, y_max = int(min(ys)), int(max(ys))
+            
+            w = x_max - x_min
+            h = y_max - y_min
+            
+            detections.append({
+                'text': text,
+                'x': x_min,
+                'y': y_min,
+                'w': w,
+                'h': h
+            })
+            
+        return detections
 
     def contains_japanese(self, text):
         # Checks for Hiragana, Katakana, or Kanji
@@ -77,10 +81,6 @@ class Translator:
         # Kanji: 4E00-9FAF
         return bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', text))
 
-    def is_text_english(self, text):
-        # We handle this via contains_japanese now, so this is redundant but kept for interface compatibility if needed
-        return not self.contains_japanese(text)
-
     def translate_text(self, text, source='ja', target='en'):
         if not text:
             return ""
@@ -89,10 +89,11 @@ class Translator:
             return self.translation_cache[text]
 
         try:
-            translated = GoogleTranslator(source='auto', target=target).translate(text)
+            # Argos Translate
+            translated = argostranslate.translate.translate(text, source, target)
             self.translation_cache[text] = translated
             return translated
-        except Exception as e:
+        except Exception:
             return text
 
     def process_frame(self, frame):

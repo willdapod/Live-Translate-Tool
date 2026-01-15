@@ -29,7 +29,7 @@ class LiveTranslateApp:
         self.frame_count = 0
         self.last_ocr_time = 0
         self.current_translations = []
-        self.ocr_interval = 0.5 # Increased frequency
+        self.ocr_interval = 0.0 # Fast as possible
         self.last_frame = None
         self.ocr_thread_running = False
 
@@ -112,8 +112,8 @@ class LiveTranslateApp:
             self.canvas.image = imgtk # Keep reference
 
             # --- OCR Trigger ---
-            current_time = time.time()
-            if current_time - self.last_ocr_time > self.ocr_interval and not self.ocr_thread_running:
+            # Trigger if previous thread finished. Zero delay.
+            if not self.ocr_thread_running:
                 self.trigger_ocr()
         
         self.root.after(10, self.update_video) # Loop ~100fps max attempt

@@ -6,3 +6,5 @@ numpy
 pygrabber
 deep-translator
 langdetect
+rapidocr_onnxruntime
+argostranslate
