@@ -9,6 +9,15 @@
 *.userosscache
 *.sln.docstates
 config.json
+venv/
+venv_old/
+Live-Translate-Tool/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.vscode/
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
