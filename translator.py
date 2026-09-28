@@ -7,6 +7,7 @@ import threading
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 from deep_translator.exceptions import TooManyRequests
 import onnxruntime as ort
+import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 
 # Japanese Unicode Ranges:
@@ -124,18 +125,38 @@ class Translator:
                 if os.path.exists(jp_model) and os.path.exists(jp_dict):
                     print(f"[Translator] Initializing RapidOCR with dedicated Japanese PP-OCR model (DirectML GPU={use_dml})...")
                     try:
-                        self.rapid_engine = RapidOCR(rec_model_path=jp_model, rec_keys_path=jp_dict, use_dml=use_dml)
+                        self.rapid_engine = RapidOCR(
+                            rec_model_path=jp_model,
+                            rec_keys_path=jp_dict,
+                            det_use_dml=use_dml,
+                            cls_use_dml=use_dml,
+                            rec_use_dml=use_dml
+                        )
                     except Exception as e:
                         print(f"[Translator] DirectML GPU init failed: {e}. Falling back to CPU...")
-                        self.rapid_engine = RapidOCR(rec_model_path=jp_model, rec_keys_path=jp_dict, use_dml=False)
+                        self.rapid_engine = RapidOCR(rec_model_path=jp_model, rec_keys_path=jp_dict)
                 else:
                     print(f"[Translator] Initializing RapidOCR (DirectML GPU={use_dml})...")
                     try:
-                        self.rapid_engine = RapidOCR(use_dml=use_dml)
+                        self.rapid_engine = RapidOCR(
+                            det_use_dml=use_dml,
+                            cls_use_dml=use_dml,
+                            rec_use_dml=use_dml
+                        )
                     except Exception as e:
                         print(f"[Translator] DirectML init failed: {e}. Falling back to standard RapidOCR...")
-                        self.rapid_engine = RapidOCR(use_dml=False)
-                print("[Translator] RapidOCR ready.")
+                        self.rapid_engine = RapidOCR()
+
+                # Verify active execution providers on the recognizer session
+                rec_sess = getattr(self.rapid_engine.text_rec, 'session', None)
+                active_prov = rec_sess.session.get_providers() if hasattr(rec_sess, 'session') else []
+                print(f"[Translator] RapidOCR ready. Active providers: {active_prov}")
+                if use_dml:
+                    try:
+                        dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+                        self.rapid_engine(dummy)
+                    except Exception:
+                        pass
             self.current_engine_name = 'rapidocr'
         elif engine_name == 'easyocr':
             if self.easy_engine is None:
