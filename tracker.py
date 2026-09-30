@@ -122,10 +122,40 @@ class TextTracker:
         if current_time is None:
             current_time = time.time()
         # Discard any track not refreshed within max_age_seconds
-        self.tracks = [
+        active = [
             t for t in self.tracks
             if (current_time - t['last_seen']) <= self.max_age_seconds
         ]
+        # Deduplicate overlapping tracks (NMS)
+        if len(active) > 1:
+            active.sort(key=lambda t: (t.get('hits', 1), t['box'][2] * t['box'][3]), reverse=True)
+            survivors = []
+            for t in active:
+                tb = t['box']
+                area_t = tb[2] * tb[3]
+                dup = False
+                for s in survivors:
+                    sb = s['box']
+                    area_s = sb[2] * sb[3]
+                    iou = self.calculate_iou(tb, sb)
+                    if iou > 0.35:
+                        dup = True
+                        break
+                    # Containment check
+                    ox1 = max(tb[0], sb[0])
+                    oy1 = max(tb[1], sb[1])
+                    ox2 = min(tb[0] + tb[2], sb[0] + sb[2])
+                    oy2 = min(tb[1] + tb[3], sb[1] + sb[3])
+                    if ox2 > ox1 and oy2 > oy1:
+                        inter = (ox2 - ox1) * (oy2 - oy1)
+                        if area_t > 0 and area_s > 0 and (inter / float(min(area_t, area_s)) > 0.40):
+                            dup = True
+                            break
+                if not dup:
+                    survivors.append(t)
+            self.tracks = survivors
+        else:
+            self.tracks = active
 
     def get_active(self, current_time=None):
         if current_time is None:

@@ -30,15 +30,25 @@ Real-time AI-powered on-screen video and game translation tool. Captures video f
 
 ---
 
-## 🚀 How to Run
+## 🚀 Quick Start (One-Click)
 
-```powershell
-& ./venv/Scripts/python.exe main.py
-```
+### For Yourself & Other Players:
+1. **Launch**: Just double-click **`Launch.bat`**.
+   - Automatically starts the Ollama background service if installed.
+   - Automatically launches the app cleanly with zero console lag.
+   - If running for the first time, it automatically triggers `setup.bat`.
 
-Or from within `Live-Translate-Tool`:
+2. **First-Time Setup (Optional)**:
+   - Double-click **`setup.bat`**.
+   - Installs required dependencies into a virtual environment.
+   - Optionally installs Ollama and downloads the **Mistral-NeMo 12B** model (`mistral-nemo:12b-instruct-2407-q5_K_M`, ~8.5 GB).
+   - *Note*: If model download is skipped, the app still works 100% out of the box with the built-in Elder Scrolls IV: Oblivion localization dictionary and fast offline translator!
 
-```powershell
-cd Live-Translate-Tool
-& ./venv/Scripts/python.exe main.py
-```
+---
+
+## 🎮 Translation Providers
+
+- **Auto (Hybrid)**: Checks the canonical Oblivion dictionary first (0ms), then uses Mistral-NeMo 12B if running, with automatic fallback to Argos / Google.
+- **Ollama (Mistral-NeMo)**: Prioritizes local 12B LLM neural translation for natural, context-aware dialogue and quest entries.
+- **Offline (Argos)**: 100% local, lightweight neural machine translation (no Ollama required).
+- **Google / MyMemory**: Fast online translation fallback.

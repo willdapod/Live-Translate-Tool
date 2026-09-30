@@ -4,6 +4,7 @@ import time
 import re
 import cv2
 import threading
+import requests
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 from deep_translator.exceptions import TooManyRequests
 import onnxruntime as ort
@@ -71,6 +72,143 @@ class ArgosWrapper:
             print(f"[Translator] Argos error: {e}")
             return None
 
+class OllamaWrapper:
+    """
+    Local LLM Neural Translation using Ollama (Mistral-NeMo 12B).
+    Provides state-of-the-art context-aware Japanese translation tailored for
+    The Elder Scrolls IV: Oblivion RPG lore, dialogue, and UI.
+    """
+    def __init__(self, model="mistral-nemo:12b-instruct-2407-q5_K_M", host="http://127.0.0.1:11434"):
+        self.preferred_model = model
+        self.active_model = model
+        self.host = host.rstrip('/')
+        self.is_ready = False
+        self.available_models = []
+        self._last_check_time = 0.0
+        
+        # Connect to Ollama, or auto-start background service if binary exists
+        if not self.check_connection():
+            self.ensure_server_running()
+
+    def _find_ollama_binary(self):
+        import shutil
+        p = shutil.which("ollama")
+        if p:
+            return p
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(local_app, "Programs", "Ollama", "ollama.exe"),
+            os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Ollama", "ollama.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Ollama", "ollama.exe")
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return None
+
+    def ensure_server_running(self):
+        if self.is_ready:
+            return True
+        bin_path = self._find_ollama_binary()
+        if not bin_path:
+            return False
+        try:
+            import subprocess
+            flags = 0
+            if os.name == 'nt':
+                flags = subprocess.CREATE_NO_WINDOW | 0x00000008 # DETACHED_PROCESS
+            subprocess.Popen([bin_path, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+            for _ in range(8):
+                time.sleep(0.5)
+                if self.check_connection():
+                    return True
+        except Exception:
+            pass
+        return self.is_ready
+
+    def is_model_installed(self, model_name=None):
+        target = (model_name or self.preferred_model).lower()
+        return any(target in m.lower() or m.lower() in target for m in self.available_models)
+
+    def check_connection(self):
+        try:
+            r = requests.get(f"{self.host}/api/tags", timeout=1.0)
+            if r.status_code == 200:
+                data = r.json()
+                self.available_models = [m.get('name', '') for m in data.get('models', [])]
+                self.is_ready = True
+
+                # Check if exact configured model or matching variant is present
+                exact_match = next((m for m in self.available_models if self.preferred_model.lower() == m.lower()), None)
+                if exact_match:
+                    self.active_model = exact_match
+                    print(f"[Ollama] Local Ollama ready with preferred model: {self.active_model}")
+                else:
+                    # Find any mistral-nemo variant
+                    nemo_variant = next((m for m in self.available_models if 'mistral-nemo' in m.lower()), None)
+                    if nemo_variant:
+                        self.active_model = nemo_variant
+                        print(f"[Ollama] Local Ollama ready with available variant: {self.active_model}")
+                    elif self.available_models:
+                        self.active_model = self.available_models[0]
+                        print(f"[Ollama] Local Ollama connected. Preferred '{self.preferred_model}' not found, using '{self.active_model}'.")
+                    else:
+                        print(f"[Ollama] Local Ollama server connected. No models pulled yet. Run: ollama run {self.preferred_model}")
+                return True
+        except Exception:
+            self.is_ready = False
+            return False
+
+    def translate(self, text):
+        if not text:
+            return None
+
+        now = time.time()
+        # Fast retry to detect if user launched Ollama in background
+        if not self.is_ready and (now - self._last_check_time > 8.0):
+            self._last_check_time = now
+            self.check_connection()
+
+        if not self.is_ready or not self.active_model:
+            return None
+
+        system_prompt = (
+            "You are a professional video game localization specialist for The Elder Scrolls IV: Oblivion. "
+            "Translate the Japanese game text into natural, authentic English suitable for the game's UI and dialogue. "
+            "Output ONLY the translated English text. Do not provide explanations, notes, or quotation marks."
+        )
+
+        user_prompt = f"Japanese: {text}\nEnglish:"
+
+        try:
+            payload = {
+                "model": self.active_model,
+                "prompt": user_prompt,
+                "system": system_prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "top_p": 0.9,
+                    "num_predict": 128
+                }
+            }
+            resp = requests.post(f"{self.host}/api/generate", json=payload, timeout=6.0)
+            if resp.status_code == 200:
+                res = resp.json().get("response", "").strip()
+                res = res.strip('`"\'').strip()
+                if res.lower().startswith("english:"):
+                    res = res[8:].strip()
+                lines = [l.strip() for l in res.split('\n') if l.strip()]
+                if lines:
+                    first_line = lines[0].strip('`"\'')
+                    if not any(first_line.lower().startswith(p) for p in ["here is", "translation:", "in english:"]):
+                        res = first_line
+                    else:
+                        res = lines[-1].strip('`"\'')
+                return res if res else None
+        except Exception:
+            return None
+
 class Translator:
     def __init__(self, default_engine='rapidocr', default_provider='auto', cache_file="translations.json"):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -86,8 +224,9 @@ class Translator:
         self.easy_engine = None
         
         # Translation provider states
-        self.current_provider = default_provider # 'auto', 'offline', 'google', 'mymemory'
+        self.current_provider = default_provider # 'auto', 'ollama', 'offline', 'google', 'mymemory'
         self.argos = ArgosWrapper()
+        self.ollama = OllamaWrapper(model="mistral-nemo:12b-instruct-2407-q5_K_M")
 
         # Check GPU capabilities
         self.has_dml, self.torch_cuda, self.cuda_status = detect_gpu_capabilities()
@@ -176,6 +315,8 @@ class Translator:
 
     def set_provider(self, provider_name):
         self.current_provider = provider_name.lower()
+        if self.current_provider == "ollama" and not self.ollama.is_ready:
+            self.ollama.check_connection()
 
     def _normalize_key(self, text):
         if not text:
@@ -594,7 +735,14 @@ class Translator:
         # Cooldown check: prevent hammering remote APIs for text that just failed
         if cache_key in self._pending_failed_cooldown:
             if now - self._pending_failed_cooldown[cache_key] < 8.0:
-                if self.argos.is_ready:
+                if self.ollama.is_ready:
+                    ollama_res = self.ollama.translate(text)
+                    if ollama_res and not self.is_japanese(ollama_res):
+                        with self.cache_lock:
+                            self.translation_cache[cache_key] = ollama_res
+                        self.schedule_auto_save()
+                        return ollama_res
+                elif self.argos.is_ready:
                     argos_res = self.argos.translate(text)
                     if argos_res and not self.is_japanese(argos_res):
                         with self.cache_lock:
@@ -611,14 +759,21 @@ class Translator:
         if self.google_rate_limited and (now - self.last_rate_limit_time > 300):
             self.google_rate_limited = False
 
-        # Tier 2: If Offline/Argos requested or Google is rate-limited, prioritize local Argos
-        if active_provider in ('offline', 'argos') or (self.google_rate_limited and active_provider == 'auto'):
+        # Tier 2: Ollama (Mistral-NeMo 12B local LLM) - Prioritized for 'auto' and 'ollama'
+        if not translated and (active_provider in ('auto', 'ollama')):
+            if self.ollama.is_ready:
+                res = self.ollama.translate(text)
+                if res and res.strip() and not self.is_japanese(res):
+                    translated = res.strip()
+
+        # Tier 3: Local Offline Argos Translate (if Ollama offline, or explicitly requested 'offline'/'argos')
+        if not translated and (active_provider in ('offline', 'argos') or (self.google_rate_limited and active_provider == 'auto')):
             if self.argos.is_ready:
                 res = self.argos.translate(text)
                 if res and res.strip() and not self.is_japanese(res):
                     translated = res.strip()
 
-        # Tier 3: Attempt Google Translate if allowed, not rate-limited, and not offline-only
+        # Tier 4: Attempt Google Translate if allowed, not rate-limited, and not offline-only
         if not translated and not self.google_rate_limited and active_provider in ('auto', 'google'):
             # Enforce 250ms spacing between Google requests to avoid bursting over limits
             if now - self._last_google_request_time < 0.25:
@@ -645,7 +800,7 @@ class Translator:
                 else:
                     print(f"[Translator] Google translation error: {e}")
 
-        # Tier 4: Fallback to local offline Argos Translate if Google failed or was rate-limited
+        # Tier 5: Fallback to local offline Argos Translate if Google failed or was rate-limited
         if not translated and self.argos.is_ready:
             try:
                 res = self.argos.translate(text)
@@ -654,8 +809,8 @@ class Translator:
             except Exception as e:
                 print(f"[Translator] Argos fallback error: {e}")
 
-        # Tier 5: Fallback to MyMemory if still unresolved
-        if not translated and not self.google_rate_limited:
+        # Tier 6: Fallback to MyMemory if still unresolved
+        if not translated and not self.google_rate_limited and active_provider in ('auto', 'mymemory'):
             try:
                 src_lang = 'japanese' if (source == 'ja' or self.is_japanese(text)) else 'auto'
                 tgt_lang = 'english' if target == 'en' else target

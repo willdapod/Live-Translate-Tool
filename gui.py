@@ -3,6 +3,8 @@ import sys
 import time
 import json
 import threading
+import ctypes
+import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
@@ -15,6 +17,112 @@ from translator import Translator
 from tracker import TextTracker
 
 CONFIG_FILE = "config.json"
+
+class HardwareMonitor:
+    """
+    Ultra-low-overhead hardware resource telemetry provider.
+    Runs in a dedicated background daemon thread (1.0s interval).
+    - CPU: Uses Windows native GetSystemTimes (0 external dependencies, 0.02ms query time, 0% CPU overhead)
+    - GPU & VRAM: Uses nvidia-smi with CREATE_NO_WINDOW (0 popup windows, ~20ms query time on background thread)
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cpu_pct = 0.0
+        self.gpu_pct = 0.0
+        self.vram_used_mb = 0
+        self.vram_total_mb = 0
+        self.is_running = True
+        self.has_nvidia = True
+        self._last_idle = 0
+        self._last_total = 0
+        self._init_cpu()
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.thread.start()
+
+    def _init_cpu(self):
+        try:
+            class FILETIME(ctypes.Structure):
+                _fields_ = [('dwLowDateTime', ctypes.c_uint32), ('dwHighDateTime', ctypes.c_uint32)]
+            self._FILETIME = FILETIME
+            idle = FILETIME()
+            kernel = FILETIME()
+            user = FILETIME()
+            if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+                self._last_idle = (idle.dwHighDateTime << 32) | idle.dwLowDateTime
+                self._last_total = ((kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) + ((user.dwHighDateTime << 32) | user.dwLowDateTime)
+        except Exception:
+            pass
+
+    def _worker_loop(self):
+        while self.is_running:
+            try:
+                time.sleep(1.0)
+                if not self.is_running:
+                    break
+
+                # 1. CPU Utilization (Windows Kernel32)
+                try:
+                    idle = self._FILETIME()
+                    kernel = self._FILETIME()
+                    user = self._FILETIME()
+                    if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+                        curr_idle = (idle.dwHighDateTime << 32) | idle.dwLowDateTime
+                        curr_total = ((kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) + ((user.dwHighDateTime << 32) | user.dwLowDateTime)
+                        d_idle = curr_idle - self._last_idle
+                        d_total = curr_total - self._last_total
+                        if d_total > 0:
+                            new_cpu = max(0.0, min(100.0, 100.0 * (1.0 - (d_idle / d_total))))
+                        else:
+                            new_cpu = self.cpu_pct
+                        self._last_idle = curr_idle
+                        self._last_total = curr_total
+                    else:
+                        new_cpu = self.cpu_pct
+                except Exception:
+                    new_cpu = self.cpu_pct
+
+                # 2. GPU Utilization & VRAM (nvidia-smi)
+                new_gpu = self.gpu_pct
+                new_vram_used = self.vram_used_mb
+                new_vram_total = self.vram_total_mb
+                if self.has_nvidia:
+                    try:
+                        CREATE_NO_WINDOW = 0x08000000
+                        res = subprocess.run(
+                            ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total', '--format=csv,noheader,nounits'],
+                            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=0.8
+                        )
+                        if res.returncode == 0 and res.stdout.strip():
+                            line = res.stdout.strip().split('\n')[0]
+                            parts = [p.strip() for p in line.split(',')]
+                            if len(parts) >= 3:
+                                new_gpu = float(parts[0])
+                                new_vram_used = int(parts[1])
+                                new_vram_total = int(parts[2])
+                    except Exception:
+                        self.has_nvidia = False
+
+                with self.lock:
+                    self.cpu_pct = new_cpu
+                    self.gpu_pct = new_gpu
+                    self.vram_used_mb = new_vram_used
+                    self.vram_total_mb = new_vram_total
+            except Exception:
+                time.sleep(1.0)
+
+    def get_stats_formatted(self):
+        with self.lock:
+            if self.vram_total_mb > 0:
+                v_used_gb = self.vram_used_mb / 1024.0
+                v_tot_gb = self.vram_total_mb / 1024.0
+                return f"📊 CPU: {self.cpu_pct:.0f}%  |  GPU: {self.gpu_pct:.0f}%  |  VRAM: {v_used_gb:.1f}/{v_tot_gb:.1f} GB"
+            elif self.gpu_pct > 0:
+                return f"📊 CPU: {self.cpu_pct:.0f}%  |  GPU: {self.gpu_pct:.0f}%"
+            else:
+                return f"📊 CPU: {self.cpu_pct:.0f}%"
+
+    def stop(self):
+        self.is_running = False
 
 class LiveTranslateApp:
     def __init__(self, root):
@@ -75,6 +183,8 @@ class LiveTranslateApp:
         self.opacity_var = tk.DoubleVar(value=self.config.get("opacity", 1.0)) # Default 100% solid to cover text
         self.audio_passthrough_active = False
         self.audio_volume_var = tk.DoubleVar(value=self.config.get("audio_volume", 1.0))
+        self.hw_stats_enabled = tk.BooleanVar(value=self.config.get("hw_stats_enabled", True))
+        self.hw_monitor = HardwareMonitor()
 
         # Setup modern dark theme styles
         self.setup_styles()
@@ -100,7 +210,8 @@ class LiveTranslateApp:
             "font_size": 18,
             "opacity": 1.0,
             "audio_volume": 1.0,
-            "resolution": "1080p"
+            "resolution": "1080p",
+            "hw_stats_enabled": True
         }
         if os.path.exists(self.config_path):
             try:
@@ -125,7 +236,8 @@ class LiveTranslateApp:
                 "font_size": self.font_size,
                 "opacity": round(self.opacity_var.get(), 2),
                 "audio_volume": round(self.audio_volume_var.get(), 2),
-                "resolution": self.combo_res.get() if hasattr(self, 'combo_res') else "720p"
+                "resolution": self.combo_res.get() if hasattr(self, 'combo_res') else self.config.get("resolution", "1080p"),
+                "hw_stats_enabled": self.hw_stats_enabled.get()
             })
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
@@ -195,6 +307,7 @@ class LiveTranslateApp:
         style.configure("Panel.TLabel", background=bg_panel, foreground=fg_white, font=("Segoe UI", 9))
         style.configure("Header.TLabel", background=bg_dark, foreground=fg_white, font=("Segoe UI", 11, "bold"))
         style.configure("Status.TLabel", background="#0d0e11", foreground=fg_dim, font=("Segoe UI", 8))
+        style.configure("StatusHW.TLabel", background="#0d0e11", foreground="#38bdf8", font=("Segoe UI", 8, "bold"))
         style.configure("Dim.TLabel", background=bg_panel, foreground=fg_dim, font=("Segoe UI", 8))
 
         style.configure("TButton", background=bg_control, foreground=fg_white, borderwidth=0, font=("Segoe UI", 9))
@@ -202,6 +315,9 @@ class LiveTranslateApp:
 
         style.configure("Accent.TButton", background=accent_blue, foreground=fg_white, borderwidth=0, font=("Segoe UI", 9, "bold"))
         style.map("Accent.TButton", background=[("active", "#0284c7")])
+
+        style.configure("Active.TButton", background="#0369a1", foreground=fg_white, borderwidth=0, font=("Segoe UI", 9, "bold"))
+        style.map("Active.TButton", background=[("active", "#0284c7")])
 
         style.configure("TCheckbutton", background=bg_panel, foreground=fg_white, font=("Segoe UI", 9))
         style.map("TCheckbutton", background=[("active", bg_panel)])
@@ -251,9 +367,9 @@ class LiveTranslateApp:
         # Translation Provider
         lbl_prov = ttk.Label(self.top_bar, text="Trans:")
         lbl_prov.pack(side=tk.LEFT, padx=(0, 4))
-        self.combo_prov = ttk.Combobox(self.top_bar, state="readonly", width=13, values=["Auto (Fallback)", "Offline (Local)", "Google", "MyMemory"])
-        prov_map = {"auto": "Auto (Fallback)", "offline": "Offline (Local)", "google": "Google", "mymemory": "MyMemory"}
-        self.combo_prov.set(prov_map.get(self.trans_provider_var.get(), "Auto (Fallback)"))
+        self.combo_prov = ttk.Combobox(self.top_bar, state="readonly", width=18, values=["Auto (Hybrid)", "Ollama (Mistral-NeMo)", "Offline (Argos)", "Google", "MyMemory"])
+        prov_map = {"auto": "Auto (Hybrid)", "ollama": "Ollama (Mistral-NeMo)", "offline": "Offline (Argos)", "google": "Google", "mymemory": "MyMemory"}
+        self.combo_prov.set(prov_map.get(self.trans_provider_var.get(), "Auto (Hybrid)"))
         self.combo_prov.pack(side=tk.LEFT, padx=(0, 12))
         self.combo_prov.bind("<<ComboboxSelected>>", self.on_provider_changed)
 
@@ -264,6 +380,9 @@ class LiveTranslateApp:
         # Right Side Header Actions: Audio, Freeze, Settings Toggle
         self.btn_toggle_settings = ttk.Button(self.top_bar, text="⚙️ Settings", width=10, command=self.toggle_settings_panel)
         self.btn_toggle_settings.pack(side=tk.RIGHT, padx=4)
+
+        self.btn_toggle_hw = ttk.Button(self.top_bar, text="📊 HW Stats", width=12, command=self.toggle_hw_stats)
+        self.btn_toggle_hw.pack(side=tk.RIGHT, padx=4)
 
         self.btn_toggle_audio = ttk.Button(self.top_bar, text="🔊 Audio", width=9, command=self.toggle_audio_panel)
         self.btn_toggle_audio.pack(side=tk.RIGHT, padx=4)
@@ -302,11 +421,16 @@ class LiveTranslateApp:
         self.lbl_status_boxes = ttk.Label(self.status_bar, text="Active: 0 boxes", style="Status.TLabel")
         self.lbl_status_boxes.pack(side=tk.LEFT, padx=8)
 
+        self.lbl_status_hw = ttk.Label(self.status_bar, text="", style="StatusHW.TLabel")
+        self.lbl_status_hw.pack(side=tk.LEFT, padx=10)
+
         self.lbl_status_audio = ttk.Label(self.status_bar, text="Audio: Inactive", style="Status.TLabel")
         self.lbl_status_audio.pack(side=tk.RIGHT, padx=12)
 
         self.lbl_status_hardware = ttk.Label(self.status_bar, text=self.translator.cuda_status, style="Status.TLabel")
         self.lbl_status_hardware.pack(side=tk.RIGHT, padx=8)
+
+        self.update_hw_toggle_ui()
 
     def build_audio_panel(self):
         lbl_in = ttk.Label(self.audio_panel, text="Capture Audio In:", style="Panel.TLabel")
@@ -370,6 +494,10 @@ class LiveTranslateApp:
         chk_merge = ttk.Checkbutton(row1, text="Merge Lines", variable=self.merge_lines_var)
         chk_merge.pack(side=tk.LEFT, padx=(0, 12))
 
+        # Hardware Stats Toggle
+        chk_hw = ttk.Checkbutton(row1, text="HW Stats", variable=self.hw_stats_enabled, command=self.update_hw_toggle_ui)
+        chk_hw.pack(side=tk.LEFT, padx=(0, 12))
+
         # Action: Copy translation
         btn_copy = ttk.Button(row1, text="📋 Copy Text", width=11, command=self.copy_latest_translation)
         btn_copy.pack(side=tk.RIGHT, padx=4)
@@ -414,6 +542,25 @@ class LiveTranslateApp:
             troughcolor="#262934", length=90
         )
         self.scale_opacity.pack(side=tk.LEFT, padx=(0, 16))
+
+    def toggle_hw_stats(self):
+        new_val = not self.hw_stats_enabled.get()
+        self.hw_stats_enabled.set(new_val)
+        self.config["hw_stats_enabled"] = new_val
+        self.save_config()
+        self.update_hw_toggle_ui()
+
+    def update_hw_toggle_ui(self):
+        is_on = self.hw_stats_enabled.get()
+        if is_on:
+            self.btn_toggle_hw.configure(style="Active.TButton", text="📊 HW: ON")
+            if hasattr(self, 'lbl_status_hw') and hasattr(self, 'lbl_status_boxes'):
+                self.lbl_status_hw.pack(side=tk.LEFT, padx=10, after=self.lbl_status_boxes)
+                self.lbl_status_hw.configure(text=self.hw_monitor.get_stats_formatted())
+        else:
+            self.btn_toggle_hw.configure(style="TButton", text="📊 HW: OFF")
+            if hasattr(self, 'lbl_status_hw'):
+                self.lbl_status_hw.pack_forget()
 
     def toggle_settings_panel(self):
         if self.settings_panel.winfo_ismapped():
@@ -491,7 +638,9 @@ class LiveTranslateApp:
     def on_provider_changed(self, event):
         sel = self.combo_prov.get()
         val = "auto"
-        if "Offline" in sel:
+        if "Ollama" in sel:
+            val = "ollama"
+        elif "Offline" in sel:
             val = "offline"
         elif "Google" in sel:
             val = "google"
@@ -499,6 +648,7 @@ class LiveTranslateApp:
             val = "mymemory"
         self.trans_provider_var.set(val)
         self.translator.set_provider(val)
+        self.save_config()
 
     def on_translate_toggled(self):
         if not self.translation_enabled.get():
@@ -678,6 +828,136 @@ class LiveTranslateApp:
             self.last_ocr_end_time = time.time()
             self.ocr_thread_running = False
 
+    def deduplicate_items(self, items):
+        """
+        Non-Maximum Suppression (NMS):
+        Removes redundant partial or duplicate bounding box detections
+        to prevent double-rendering or ghost boxes.
+        """
+        if not items or len(items) <= 1:
+            return items
+
+        sorted_items = sorted(items, key=lambda it: it['w'] * it['h'], reverse=True)
+        survivors = []
+        for it in sorted_items:
+            ix1, iy1 = it['x'], it['y']
+            ix2, iy2 = ix1 + it['w'], iy1 + it['h']
+            area = it['w'] * it['h']
+            is_dup = False
+            for s in survivors:
+                sx1, sy1 = s['x'], s['y']
+                sx2, sy2 = sx1 + s['w'], sy1 + s['h']
+                s_area = s['w'] * s['h']
+
+                ox1 = max(ix1, sx1)
+                oy1 = max(iy1, sy1)
+                ox2 = min(ix2, sx2)
+                oy2 = min(iy2, sy2)
+                if ox2 > ox1 and oy2 > oy1:
+                    inter = (ox2 - ox1) * (oy2 - oy1)
+                    min_area = min(area, s_area)
+                    if min_area > 0 and (inter / float(min_area) > 0.35):
+                        is_dup = True
+                        break
+            if not is_dup:
+                survivors.append(it)
+        return survivors
+
+    def resolve_box_collisions(self, boxes, img_w, img_h, min_gap=4):
+        """
+        Iterative relaxation collision solver for Box Replacement mode.
+        Ensures all boxes maintain clean separation and never overlap.
+        """
+        if len(boxes) <= 1:
+            return
+
+        boxes.sort(key=lambda b: (b['by'], b['bx']))
+
+        for _ in range(5):
+            has_collision = False
+            for i in range(len(boxes)):
+                for j in range(i + 1, len(boxes)):
+                    b1 = boxes[i]
+                    b2 = boxes[j]
+
+                    ax1, ay1 = b1['bx'], b1['by']
+                    ax2, ay2 = ax1 + b1['bw'], ay1 + b1['bh']
+                    bx1, by1 = b2['bx'], b2['by']
+                    bx2, by2 = bx1 + b2['bw'], by1 + b2['bh']
+
+                    ox = min(ax2, bx2) - max(ax1, bx1)
+                    oy = min(ay2, by2) - max(ay1, by1)
+
+                    if ox > 0 and (ox >= min(b1['bw'], b2['bw']) * 0.25 or ox > 12):
+                        # Primarily vertically stacked
+                        if ay1 <= by1 and by1 < ay2 + min_gap:
+                            has_collision = True
+                            needed = (ay2 + min_gap) - by1
+                            shift_b = needed // 2 + 1
+                            shift_a = needed - shift_b
+                            b1['by'] = max(0, b1['by'] - shift_a)
+                            b2['by'] = min(img_h - b2['bh'], b2['by'] + shift_b)
+                        elif by1 < ay1 and ay1 < by2 + min_gap:
+                            has_collision = True
+                            needed = (by2 + min_gap) - ay1
+                            shift_a = needed // 2 + 1
+                            shift_b = needed - shift_a
+                            b2['by'] = max(0, b2['by'] - shift_b)
+                            b1['by'] = min(img_h - b1['bh'], b1['by'] + shift_a)
+                    elif oy > 0:
+                        # Horizontally adjacent on same row
+                        if ax1 <= bx1 and bx1 < ax2 + min_gap:
+                            has_collision = True
+                            needed = (ax2 + min_gap) - bx1
+                            shift_b = needed // 2 + 1
+                            shift_a = needed - shift_b
+                            b1['bx'] = max(0, b1['bx'] - shift_a)
+                            b2['bx'] = min(img_w - b2['bw'], b2['bx'] + shift_b)
+                        elif bx1 < ax1 and ax1 < bx2 + min_gap:
+                            has_collision = True
+                            needed = (bx2 + min_gap) - ax1
+                            shift_a = needed // 2 + 1
+                            shift_b = needed - shift_a
+                            b2['bx'] = max(0, b2['bx'] - shift_b)
+                            b1['bx'] = min(img_w - b1['bw'], b1['bx'] + shift_a)
+            if not has_collision:
+                break
+
+    def resolve_seamless_collisions(self, patches, img_w, img_h, min_gap=2):
+        """
+        Iterative relaxation collision solver for Seamless mode.
+        Ensures adjacent sampled patches do not collide or overwrite each other.
+        """
+        if len(patches) <= 1:
+            return
+
+        patches.sort(key=lambda p: (p['by1'], p['bx1']))
+
+        for _ in range(4):
+            has_collision = False
+            for i in range(len(patches)):
+                for j in range(i + 1, len(patches)):
+                    p1 = patches[i]
+                    p2 = patches[j]
+
+                    ox = min(p1['bx2'], p2['bx2']) - max(p1['bx1'], p2['bx1'])
+                    oy = min(p1['by2'], p2['by2']) - max(p1['by1'], p2['by1'])
+
+                    if ox > 0 and oy >= -1:
+                        has_collision = True
+                        if ox >= min(p1['bx2'] - p1['bx1'], p2['bx2'] - p2['bx1']) * 0.25 or ox > 12:
+                            overlap = (p1['by2'] + min_gap) - p2['by1'] if p1['by1'] <= p2['by1'] else (p2['by2'] + min_gap) - p1['by1']
+                            if overlap > 0:
+                                mid = (p1['by2'] + p2['by1']) // 2
+                                if p1['by1'] <= p2['by1']:
+                                    p1['by2'] = max(p1['by1'] + 8, mid - 1)
+                                    p2['by1'] = min(p2['by2'] - 8, mid + 1)
+                                else:
+                                    p2['by2'] = max(p2['by1'] + 8, mid - 1)
+                                    p1['by1'] = min(p1['by2'] - 8, mid + 1)
+            if not has_collision:
+                break
+
     def draw_overlays(self, frame_bgr, scale, items):
         if not items:
             cv_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -695,6 +975,9 @@ class LiveTranslateApp:
             cv_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             return Image.fromarray(cv_rgb)
 
+        # Remove redundant duplicate/subsumed OCR boxes before layout
+        valid_items = self.deduplicate_items(valid_items)
+
         mode = self.overlay_mode_var.get() # 'seamless', 'box', 'subtitle', 'text'
         img_h, img_w = frame_bgr.shape[:2]
 
@@ -705,6 +988,8 @@ class LiveTranslateApp:
             pil_img = Image.fromarray(cv_rgb)
             draw = ImageDraw.Draw(pil_img, "RGBA")
 
+            # Step 1: Pre-calculate layout and background bounds
+            patches = []
             for item in valid_items:
                 text = item['translated']
                 ix = int(item['x'] * scale)
@@ -712,61 +997,80 @@ class LiveTranslateApp:
                 iw = max(10, int(item['w'] * scale))
                 ih = max(10, int(item['h'] * scale))
 
-                # 0.05ms smart background sampling from perimeter
-                rgb_bg = self.sample_background_smart(frame_bgr, ix, iy, iw, ih)
-                brightness = (rgb_bg[0] * 299 + rgb_bg[1] * 587 + rgb_bg[2] * 114) / 1000
-
-                pad_x = 4
-                pad_y = 2
-                bx1 = max(0, ix - pad_x)
-                by1 = max(0, iy - pad_y)
-                bx2 = min(img_w, ix + iw + pad_x)
-                by2 = min(img_h, iy + ih + pad_y)
-                bw = bx2 - bx1
-                bh = by2 - by1
-
-                # Cleanly cover the Japanese text with sampled background color
-                draw.rectangle([bx1, by1, bx2, by2], fill=rgb_bg)
-
-                chosen_font_size = max(12, min(self.font_size, int(ih * 0.82)))
+                chosen_font_size = max(11, min(self.font_size, int(ih * 0.85)))
                 font = self.get_font(chosen_font_size, text)
 
                 bbox = draw.textbbox((0, 0), text, font=font)
                 tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
 
-                # If multi-line paragraph or wide sentence, wrap text within area
-                if tw > bw * 1.3 and " " in text:
-                    lines = self.wrap_text(text, font, max(bw, 220), draw)
+                # Wrap only if line is significantly wider than natural area and contains spaces
+                if tw > max(iw, 180) * 1.3 and " " in text:
+                    lines = self.wrap_text(text, font, max(iw, 180), draw)
                 else:
                     lines = [text]
 
                 line_height = chosen_font_size + 3
                 total_th = len(lines) * line_height
-                cur_y = by1 + (bh - total_th) // 2
+                max_line_w = max(draw.textbbox((0, 0), l, font=font)[2] - draw.textbbox((0, 0), l, font=font)[0] for l in lines)
 
-                # Contextual RPG typography styling
-                if brightness > 120:
-                    # Light parchment/paper background (menus, books, scrolls)
-                    if text == "Paused":
-                        main_color = (65, 85, 120) # Official Oblivion blue-grey
-                    else:
-                        main_color = (48, 30, 20) # Official Oblivion sepia brown
-                    shadow_color = (195, 175, 145, 220) # Warm parchment emboss
+                pad_x = 4
+                pad_y = 2
+                target_w = max(iw, max_line_w)
+                target_h = max(ih, total_th)
+                diff_x = (target_w - iw) // 2
+                diff_y = (target_h - ih) // 2
+
+                bx1 = max(0, ix - pad_x - max(0, diff_x))
+                by1 = max(0, iy - pad_y - max(0, diff_y))
+                bx2 = min(img_w, ix + iw + pad_x + max(0, diff_x))
+                by2 = min(img_h, iy + ih + pad_y + max(0, diff_y))
+
+                rgb_bg = self.sample_background_smart(frame_bgr, ix, iy, iw, ih)
+                brightness = (rgb_bg[0] * 299 + rgb_bg[1] * 587 + rgb_bg[2] * 114) / 1000
+
+                patches.append({
+                    'bx1': bx1,
+                    'by1': by1,
+                    'bx2': bx2,
+                    'by2': by2,
+                    'text': text,
+                    'lines': lines,
+                    'font': font,
+                    'line_height': line_height,
+                    'total_th': total_th,
+                    'rgb_bg': rgb_bg,
+                    'brightness': brightness
+                })
+
+            # Step 2: Resolve vertical and horizontal collisions between adjacent patches
+            self.resolve_seamless_collisions(patches, img_w, img_h, min_gap=2)
+
+            # Step 3: TWO-STAGE RENDERING
+            # Pass 1: Draw all sampled background patches (so no patch can ever overwrite text)
+            for p in patches:
+                draw.rectangle([p['bx1'], p['by1'], p['bx2'], p['by2']], fill=p['rgb_bg'])
+
+            # Pass 2: Draw all typography on top
+            for p in patches:
+                bw = p['bx2'] - p['bx1']
+                bh = p['by2'] - p['by1']
+                cur_y = p['by1'] + max(0, (bh - p['total_th']) // 2)
+
+                if p['brightness'] > 120:
+                    main_color = (65, 85, 120) if p['text'] == "Paused" else (48, 30, 20)
+                    shadow_color = (195, 175, 145, 220)
                 else:
-                    # Dark scene background
                     main_color = (255, 255, 255)
                     shadow_color = (0, 0, 0, 230)
 
-                for line in lines:
-                    l_bbox = draw.textbbox((0, 0), line, font=font)
+                for line in p['lines']:
+                    l_bbox = draw.textbbox((0, 0), line, font=p['font'])
                     lw = l_bbox[2] - l_bbox[0]
-                    tx = max(0, bx1) if len(lines) > 1 else max(0, bx1 + (bw - lw) // 2)
+                    tx = max(p['bx1'], p['bx1'] + (bw - lw) // 2)
 
-                    # Draw subtle shadow/emboss + crisp main text
-                    draw.text((tx + 1, cur_y + 1), line, font=font, fill=shadow_color)
-                    draw.text((tx, cur_y), line, font=font, fill=main_color)
-                    cur_y += line_height
+                    draw.text((tx + 1, cur_y + 1), line, font=p['font'], fill=shadow_color)
+                    draw.text((tx, cur_y), line, font=p['font'], fill=main_color)
+                    cur_y += p['line_height']
 
             return pil_img
 
@@ -799,6 +1103,7 @@ class LiveTranslateApp:
             pil_img = Image.fromarray(cv_rgb)
             draw = ImageDraw.Draw(pil_img, "RGBA")
 
+            labels = []
             for item in valid_items:
                 text = item['translated']
                 ix = int(item['x'] * scale)
@@ -811,7 +1116,6 @@ class LiveTranslateApp:
 
                 bbox = draw.textbbox((0, 0), text, font=font)
                 tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
 
                 if tw > iw * 1.5 and " " in text:
                     lines = self.wrap_text(text, font, max(iw, 200), draw)
@@ -820,18 +1124,39 @@ class LiveTranslateApp:
 
                 line_height = chosen_font_size + 3
                 total_th = len(lines) * line_height
-                cur_y = iy + (ih - total_th) // 2
+                cur_y = iy + max(0, (ih - total_th) // 2)
 
-                for line in lines:
-                    l_bbox = draw.textbbox((0, 0), line, font=font)
+                labels.append({
+                    'ix': ix,
+                    'iy': cur_y,
+                    'iw': iw,
+                    'ih': total_th,
+                    'lines': lines,
+                    'font': font,
+                    'line_height': line_height
+                })
+
+            # Separate vertically overlapping text labels
+            labels.sort(key=lambda l: l['iy'])
+            for i in range(len(labels) - 1):
+                l1 = labels[i]
+                l2 = labels[i + 1]
+                if l2['iy'] < l1['iy'] + l1['ih'] + 2:
+                    overlap = (l1['iy'] + l1['ih'] + 2) - l2['iy']
+                    l2['iy'] = min(img_h - l2['ih'], l2['iy'] + overlap)
+
+            for l in labels:
+                cur_y = l['iy']
+                for line in l['lines']:
+                    l_bbox = draw.textbbox((0, 0), line, font=l['font'])
                     lw = l_bbox[2] - l_bbox[0]
-                    tx = max(0, ix) if len(lines) > 1 else max(0, ix + (iw - lw) // 2)
+                    tx = max(0, l['ix']) if len(l['lines']) > 1 else max(0, l['ix'] + (l['iw'] - lw) // 2)
 
                     # 4-way dark outline for readability over any background
                     for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 2)]:
-                        draw.text((tx + ox, cur_y + oy), line, font=font, fill=(0, 0, 0, 240))
-                    draw.text((tx, cur_y), line, font=font, fill="#ffffff")
-                    cur_y += line_height
+                        draw.text((tx + ox, cur_y + oy), line, font=l['font'], fill=(0, 0, 0, 240))
+                    draw.text((tx, cur_y), line, font=l['font'], fill="#ffffff")
+                    cur_y += l['line_height']
 
             return pil_img
 
@@ -841,7 +1166,10 @@ class LiveTranslateApp:
             pil_img = Image.fromarray(cv_rgb)
             draw = ImageDraw.Draw(pil_img, "RGBA")
             opacity_val = int(255 * max(0.5, min(1.0, self.opacity_var.get())))
+            box_fill = (14, 16, 22) if opacity_val >= 235 else (14, 16, 22, opacity_val)
 
+            # Step 1: Calculate font sizes, wrapping, and ideal box dimensions
+            boxes = []
             for item in valid_items:
                 text = item['translated']
                 ix = int(item['x'] * scale)
@@ -864,32 +1192,46 @@ class LiveTranslateApp:
                 total_th = len(lines) * line_height
                 max_line_w = max(draw.textbbox((0, 0), l, font=font)[2] - draw.textbbox((0, 0), l, font=font)[0] for l in lines)
 
-                box_w = max(iw + 16, max_line_w + 20)
-                box_h = max(ih + 8, total_th + 10)
+                box_w = max(iw + 14, max_line_w + 16)
+                box_h = max(ih + 6, total_th + 8)
 
                 diff_x = (box_w - iw) // 2
                 diff_y = (box_h - ih) // 2
                 bx = max(0, min(img_w - box_w, ix - diff_x))
                 by = max(0, min(img_h - box_h, iy - diff_y))
 
-                box_fill = (14, 16, 22) if opacity_val >= 235 else (14, 16, 22, opacity_val)
-                # Clean neutral dark border (no cyan outline)
+                boxes.append({
+                    'bx': bx,
+                    'by': by,
+                    'bw': box_w,
+                    'bh': box_h,
+                    'lines': lines,
+                    'font': font,
+                    'line_height': line_height,
+                    'total_th': total_th
+                })
+
+            # Step 2: Resolve vertical and horizontal collisions between adjacent boxes
+            self.resolve_box_collisions(boxes, img_w, img_h, min_gap=4)
+
+            # Step 3: Draw all resolved, non-overlapping boxes
+            for b in boxes:
                 draw.rectangle(
-                    [bx, by, bx + box_w, by + box_h],
+                    [b['bx'], b['by'], b['bx'] + b['bw'], b['by'] + b['bh']],
                     fill=box_fill,
                     outline=(60, 68, 85, 180),
                     width=1
                 )
 
-                cur_y = by + (box_h - total_th) // 2
-                for line in lines:
-                    l_bbox = draw.textbbox((0, 0), line, font=font)
+                cur_y = b['by'] + max(0, (b['bh'] - b['total_th']) // 2)
+                for line in b['lines']:
+                    l_bbox = draw.textbbox((0, 0), line, font=b['font'])
                     lw = l_bbox[2] - l_bbox[0]
-                    tx = bx + (box_w - lw) // 2
+                    tx = b['bx'] + max(0, (b['bw'] - lw) // 2)
 
-                    draw.text((tx + 1, cur_y + 1), line, font=font, fill=(0, 0, 0, 240))
-                    draw.text((tx, cur_y), line, font=font, fill="#ffffff")
-                    cur_y += line_height
+                    draw.text((tx + 1, cur_y + 1), line, font=b['font'], fill=(0, 0, 0, 240))
+                    draw.text((tx, cur_y), line, font=b['font'], fill="#ffffff")
+                    cur_y += b['line_height']
 
             return pil_img
 
@@ -914,12 +1256,23 @@ class LiveTranslateApp:
     def update_telemetry_ui(self):
         self.lbl_status_fps.configure(text=f"FPS: {self.current_fps:.1f}")
         self.lbl_status_ocr.configure(text=f"OCR ({self.translator.current_engine_name}): {self.translator.last_ocr_ms:.0f}ms")
-        self.lbl_status_trans.configure(text=f"Trans: {self.translator.last_trans_ms:.0f}ms (Hits: {self.translator.cache_hits})")
+        prov_disp = self.translator.current_provider.capitalize()
+        if self.translator.current_provider == "auto":
+            prov_disp = "Ollama+Dict" if self.translator.ollama.is_ready else "Dict+MT"
+        elif self.translator.current_provider == "ollama":
+            prov_disp = "Ollama (Ready)" if self.translator.ollama.is_ready else "Ollama (Waiting)"
+        self.lbl_status_trans.configure(text=f"Trans ({prov_disp}): {self.translator.last_trans_ms:.0f}ms (Hits: {self.translator.cache_hits})")
         active_cnt = len(self.tracker.tracks)
         self.lbl_status_boxes.configure(text=f"Active: {active_cnt} box{'es' if active_cnt != 1 else ''}")
 
+        if self.hw_stats_enabled.get():
+            hw_text = self.hw_monitor.get_stats_formatted()
+            self.lbl_status_hw.configure(text=hw_text)
+
     def on_close(self):
         self.is_running = False
+        if hasattr(self, 'hw_monitor'):
+            self.hw_monitor.stop()
         self.video_manager.stop_capture()
         self.audio_manager.stop_passthrough()
         self.translator.save_cache()

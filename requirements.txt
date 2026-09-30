@@ -4,13 +4,14 @@ Pillow>=10.0.0
 numpy>=1.26.0
 pygrabber>=0.2
 
-# OCR Engines
+# Hardware-Accelerated OCR
 rapidocr-onnxruntime>=1.4.0
-easyocr>=1.7.0
+onnxruntime-directml>=1.18.0
 
-# Translation
-deep-translator>=1.11.0
+# Local & Remote Translation
 requests>=2.31.0
+deep-translator>=1.11.0
+argostranslate>=1.9.0
 
 # Audio Passthrough (Capture card -> Speakers/Headphones)
 sounddevice>=0.5.0
