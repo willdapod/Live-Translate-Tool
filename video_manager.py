@@ -50,6 +50,12 @@ class VideoManager:
 
         self.current_device_index = device_index
 
+        # Request MJPG stream from capture device to unlock hardware 60 FPS on USB capture cards
+        try:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        except Exception:
+            pass
+
         # Set buffer size to 1 to eliminate frame latency
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -77,7 +83,7 @@ class VideoManager:
                     with self.frame_lock:
                         self.latest_frame = frame
                 else:
-                    time.sleep(0.005)
+                    time.sleep(0.001)
             else:
                 time.sleep(0.01)
 

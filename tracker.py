@@ -72,19 +72,25 @@ class TextTracker:
                 is_same = (det_text_clean == t_text_clean and len(det_text_clean) > 0)
 
                 if is_same:
-                    # Coordinate smoothing: 75% existing smoothed position + 25% new detection
-                    # Keeps overlays rock-solid and prevents annoying micro-jitter
-                    alpha = 0.75
-                    t['box'][0] = int(alpha * t['box'][0] + (1 - alpha) * det['x'])
-                    t['box'][1] = int(alpha * t['box'][1] + (1 - alpha) * det['y'])
-                    t['box'][2] = int(alpha * t['box'][2] + (1 - alpha) * det['w'])
-                    t['box'][3] = int(alpha * t['box'][3] + (1 - alpha) * det['h'])
+                    # Deadband coordinate stabilization:
+                    # If bounding box moved <= 4 pixels, keep the smoothed coordinates.
+                    # This eliminates micro-jitter completely and keeps rendering caches 100% warm.
+                    dx = abs(t['box'][0] - det['x'])
+                    dy = abs(t['box'][1] - det['y'])
+                    dw = abs(t['box'][2] - det['w'])
+                    dh = abs(t['box'][3] - det['h'])
+                    if dx > 4 or dy > 4 or dw > 6 or dh > 6:
+                        alpha = 0.70
+                        t['box'][0] = int(alpha * t['box'][0] + (1 - alpha) * det['x'])
+                        t['box'][1] = int(alpha * t['box'][1] + (1 - alpha) * det['y'])
+                        t['box'][2] = int(alpha * t['box'][2] + (1 - alpha) * det['w'])
+                        t['box'][3] = int(alpha * t['box'][3] + (1 - alpha) * det['h'])
                 else:
                     # Text changed (dialogue moved to next line): snap coordinates immediately
                     t['box'] = [det['x'], det['y'], det['w'], det['h']]
                     t['text'] = det.get('text', '')
 
-                if det.get('translated'):
+                if det.get('translated') and det['translated'].strip():
                     t['translated'] = det['translated']
 
                 t['conf'] = det.get('conf', 1.0)

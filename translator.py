@@ -505,15 +505,16 @@ class Translator:
         trimmed = text.strip("【】「」『』[]()（）{}・■◆★▲- :：ー―=＝%#f§*~")
         trimmed_nospaces = re.sub(r'(?<=[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff])\s+(?=[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff])', '', trimmed)
         with self.cache_lock:
-            if trimmed in self.translation_cache:
-                trans = self.translation_cache[trimmed]
+            trans = self.translation_cache.get(trimmed) or self.translation_cache.get(trimmed_nospaces)
+            if not trans:
+                nq_trim = self._normalize_key(trimmed)
+                if nq_trim and nq_trim in self.normalized_cache:
+                    trans = self.normalized_cache[nq_trim]
+            if trans:
                 if (text.startswith("【") and text.endswith("】")) or (text.startswith("[") and text.endswith("]")):
                     return f"[{trans}]"
-                return trans
-            if trimmed_nospaces in self.translation_cache:
-                trans = self.translation_cache[trimmed_nospaces]
-                if (text.startswith("【") and text.endswith("】")) or (text.startswith("[") and text.endswith("]")):
-                    return f"[{trans}]"
+                if (text.startswith("「") and text.endswith("」")) or (text.startswith("『") and text.endswith("』")):
+                    return f'"{trans}"'
                 return trans
 
         # 5. Key-Value stat patterns: e.g. "腕力: 60" or "ゴールド 250" or "防御力: 18"
@@ -595,12 +596,12 @@ class Translator:
             if now - self._pending_failed_cooldown[cache_key] < 8.0:
                 if self.argos.is_ready:
                     argos_res = self.argos.translate(text)
-                    if argos_res:
+                    if argos_res and not self.is_japanese(argos_res):
                         with self.cache_lock:
                             self.translation_cache[cache_key] = argos_res
                         self.schedule_auto_save()
                         return argos_res
-                return text
+                return "" # Return empty string instead of raw Japanese
 
         self.api_calls += 1
         active_provider = provider if provider else self.current_provider
@@ -614,7 +615,7 @@ class Translator:
         if active_provider in ('offline', 'argos') or (self.google_rate_limited and active_provider == 'auto'):
             if self.argos.is_ready:
                 res = self.argos.translate(text)
-                if res and res.strip():
+                if res and res.strip() and not self.is_japanese(res):
                     translated = res.strip()
 
         # Tier 3: Attempt Google Translate if allowed, not rate-limited, and not offline-only
@@ -625,7 +626,7 @@ class Translator:
             self._last_google_request_time = time.time()
             try:
                 res = GoogleTranslator(source=source, target=target).translate(text)
-                if res and res.strip():
+                if res and res.strip() and not self.is_japanese(res):
                     translated = res.strip()
             except Exception as e:
                 err_msg = str(e).lower()
@@ -648,7 +649,7 @@ class Translator:
         if not translated and self.argos.is_ready:
             try:
                 res = self.argos.translate(text)
-                if res and res.strip():
+                if res and res.strip() and not self.is_japanese(res):
                     translated = res.strip()
             except Exception as e:
                 print(f"[Translator] Argos fallback error: {e}")
@@ -659,19 +660,31 @@ class Translator:
                 src_lang = 'japanese' if (source == 'ja' or self.is_japanese(text)) else 'auto'
                 tgt_lang = 'english' if target == 'en' else target
                 res = MyMemoryTranslator(source=src_lang, target=tgt_lang).translate(text)
-                if res and res.strip():
+                if res and res.strip() and not self.is_japanese(res):
                     translated = res.strip()
             except Exception:
                 pass
 
         if translated:
+            # Clean any Japanese quotation marks or punctuation that could cause tofu in Latin fonts
+            clean_translated = (translated
+                .replace("「", '"')
+                .replace("」", '"')
+                .replace("『", '"')
+                .replace("』", '"')
+                .replace("【", "[")
+                .replace("】", "]")
+                .replace("・", " ")
+                .replace("〜", "~")
+                .replace("～", "~")
+                .strip())
             with self.cache_lock:
-                self.translation_cache[cache_key] = translated
+                self.translation_cache[cache_key] = clean_translated
             self.schedule_auto_save()
-            return translated
+            return clean_translated
         else:
             self._pending_failed_cooldown[cache_key] = now
-            return text
+            return ""
 
     def process_frame(self, frame, min_conf=0.3, filter_mode='ja', merge_lines=True):
         if frame is None:
