@@ -9,8 +9,8 @@ Real-time AI-powered on-screen video and game translation tool. Captures video f
 - **🚀 60 FPS Threaded Video Capture (`VideoManager`)**:
   - DirectShow hardware capture is offloaded to a dedicated background frame-grabber thread.
   - Video rendering on the GUI never blocks on hardware I/O, maintaining a smooth **60.0 FPS** display rate.
-- **⚡ DirectML GPU Acceleration on NVIDIA GeForce RTX 5070 Ti**:
-  - Leverages **DirectML (`onnxruntime-directml`)** to run ONNX neural network inference directly on the RTX 5070 Ti GPU via DirectX 12 compute shaders.
+- **⚡ DirectML GPU Acceleration on NVIDIA Graphics Card**:
+  - Leverages **DirectML (`onnxruntime-directml`)** to run ONNX neural network inference directly on the GPU via DirectX 12 compute shaders.
   - Completely bypasses CUDA `sm_120` architecture limitations with native hardware GPU acceleration.
 - **🔍 3x Faster OCR with Dynamic Downsampling**:
   - Automatically downsamples high-resolution (1080p) video frames for text detection (`max_ocr_width=960`), reducing OCR inference time to ~40–80ms while scaling bounding box coordinates back up with pixel perfection.
